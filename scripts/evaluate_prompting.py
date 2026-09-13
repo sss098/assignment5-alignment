@@ -94,7 +94,7 @@ def evaluate_prompt_type(
     )
 
     completions = server.generate_completions(
-        prompt=prompts,
+        prompts=prompts,
         sampling_params=sampling_params,
         batch_size=batch_size,
     )
