@@ -48,7 +48,7 @@ def token_prompt_and_output(
         for token_ids in all_token_ids
     )
 
-    pad_token_id = tokenizer.pad_token_type_id
+    pad_token_id = tokenizer.pad_token_id
 
     if pad_token_id is None:
         raise ValueError(

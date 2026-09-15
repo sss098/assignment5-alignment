@@ -3,6 +3,7 @@ Small vLLM helpers for server lifecycle, completion requests, and NCCL weight sy
 """
 
 import atexit
+import ipaddress
 import json
 import logging
 import os
@@ -10,12 +11,24 @@ import signal
 import subprocess
 import time
 import urllib.request
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import torch
 
 logger = logging.getLogger(__name__)
+
+
+def _urlopen_local_aware(request, timeout: int):
+    host = urllib.parse.urlsplit(request.full_url).hostname
+    try:
+        is_loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        is_loopback = host == "localhost"
+    if is_loopback:
+        return urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=timeout)
+    return urllib.request.urlopen(request, timeout=timeout)
 
 
 @dataclass
@@ -34,7 +47,7 @@ class VLLMServer:
     seed: int = 0
     load_format: str = "auto"
     logging_level: str = "ERROR"
-    gpu_memory_utilization: float = 0.9
+    gpu_memory_utilization: float = 0.75
     launch_server: bool = True
     startup_timeout: int = 600
     shutdown_timeout: int = 30
@@ -95,7 +108,7 @@ def _http_json(method: str, url: str, payload: dict | None = None, timeout: int 
         method=method,
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with _urlopen_local_aware(request, timeout=timeout) as response:
         body = response.read()
     if not body:
         return {}
@@ -121,7 +134,7 @@ def start_server(
     seed: int,
     load_format: str,
     logging_level: str,
-    gpu_memory_utilization: float = 0.9,
+    gpu_memory_utilization: float = 0.75,
 ) -> subprocess.Popen:
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(gpu)
@@ -159,7 +172,7 @@ def wait_for_server(base_url: str, process: subprocess.Popen | None, timeout: in
         if process is not None and process.poll() is not None:
             raise RuntimeError(f"vLLM server exited early with code {process.returncode}.")
         try:
-            with urllib.request.urlopen(f"{base_url}/health", timeout=5):
+            with _urlopen_local_aware(urllib.request.Request(f"{base_url}/health"), timeout=5):
                 return
         except OSError:
             time.sleep(2)
