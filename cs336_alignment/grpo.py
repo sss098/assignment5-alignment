@@ -131,124 +131,173 @@ def get_response_log_probs(
 
     return result
 
-def compute_rollout_rewards(
-    reward_fn: Callable[[str, str], dict[str, float]],
-    rollout_responses: list[str],
-    repeated_ground_truths: list[str],
-) -> tuple[torch.Tensor, dict[str, float]]:
-
-    if len(rollout_responses) != len(repeated_ground_truths):
-        raise ValueError(
-            f"rollout_responses and repeated_ground_truths must have the same length, "
-            f"but got {len(rollout_responses)} and {len(repeated_ground_truths)}"
-        )
-
-    reward_results = []
-
-    for response, ground_truth in zip(
-        rollout_responses,
-        repeated_ground_truths,
-    ):
-        result = reward_fn(
-            response,
-            ground_truth,
-        )
-
-        reward_results.append(result)
-
-    raw_rewards = torch.tensor(
-        [
-            result["reward"]
-            for result in reward_results
-        ],
-        dtype=torch.float32,
-    )
-
-    mean_reward = sum(
-        result["reward"]
-        for result in reward_results
-    ) / len(reward_results)
-
-    mean_format_reward = sum(
-        result["format_reward"]
-        for result in reward_results
-    ) / len(reward_results)
-
-    mean_answer_reward = sum(
-        result["answer_reward"]
-        for result in reward_results
-    ) / len(reward_results)
-
-    metadata = {
-        "mean_reward": mean_reward,
-        "mean_format_reward": mean_format_reward,
-        "mean_answer_reward": mean_answer_reward,
-    }
-
-    return raw_rewards, metadata
-
 def compute_group_normalized_rewards(
     raw_rewards: torch.Tensor,
     group_size: int,
-    baseline: Literal["mean", "none"] = "mean",
+    baseline: Literal[
+        "mean",
+        "none",
+    ] = "mean",
     advantage_eps: float = 1e-6,
     advantage_normalizer: Literal[
         "std",
         "none",
         "mean",
     ] = "std",
-) -> tuple[torch.Tensor, dict[str, float]]:
+) -> tuple[
+    torch.Tensor,
+    dict[str, float],
+]:
 
-    if raw_rewards.numel() % group_size != 0:
+    if group_size <= 0:
         raise ValueError(
-            "Number of rewards must be divisible "
-            "by group_size."
+            "group_size must be positive."
         )
 
-    if baseline != "mean":
-        raise NotImplementedError(
-            f"Unsupported baseline: {baseline}"
+    if (
+        raw_rewards.numel()
+        % group_size
+        != 0
+    ):
+        raise ValueError(
+            "Number of rewards must be "
+            "divisible by group_size."
         )
 
-    if advantage_normalizer != "std":
-        raise NotImplementedError(
-            "For now, only advantage_normalizer='std' "
-            "is supported."
+    # ---------------------------------------------
+    # Shape:
+    #
+    # (rollout_batch_size,)
+    #
+    # ->
+    #
+    # (num_prompts, group_size)
+    # ---------------------------------------------
+
+    grouped_rewards = (
+        raw_rewards.reshape(
+            -1,
+            group_size,
+        )
+    )
+
+    # ---------------------------------------------
+    # Statistics for each GRPO group.
+    # ---------------------------------------------
+
+    group_means = (
+        grouped_rewards.mean(
+            dim=1,
+            keepdim=True,
+        )
+    )
+
+    group_stds = (
+        grouped_rewards.std(
+            dim=1,
+            keepdim=True,
+        )
+    )
+
+    # =============================================
+    # 1. Baseline
+    # =============================================
+
+    if baseline == "mean":
+
+        grouped_advantages = (
+            grouped_rewards
+            - group_means
         )
 
-    grouped_rewards = raw_rewards.reshape(
-        -1,
-        group_size,
-    )
+    elif baseline == "none":
 
-    group_means = grouped_rewards.mean(
-        dim=1,
-        keepdim=True,
-    )
+        grouped_advantages = (
+            grouped_rewards.clone()
+        )
 
-    centered_rewards = (
-        grouped_rewards - group_means
-    )
+    else:
 
-    group_stds = grouped_rewards.std(
-        dim=1,
-        keepdim=True,
-    )
+        raise ValueError(
+            f"Unsupported baseline: "
+            f"{baseline}"
+        )
 
-    grouped_advantages = (
-        centered_rewards
-        / (group_stds + advantage_eps)
-    )
+    # =============================================
+    # 2. Advantage normalization
+    # =============================================
 
-    advantages = grouped_advantages.reshape(-1)
+    if (
+        advantage_normalizer
+        == "std"
+    ):
+
+        grouped_advantages = (
+            grouped_advantages
+            / (
+                group_stds
+                + advantage_eps
+            )
+        )
+
+    elif (
+        advantage_normalizer
+        == "none"
+    ):
+
+        # No normalization.
+        pass
+
+    elif (
+        advantage_normalizer
+        == "mean"
+    ):
+
+        grouped_advantages = (
+            grouped_advantages
+            / (
+                group_means
+                + advantage_eps
+            )
+        )
+
+    else:
+
+        raise ValueError(
+            "Unsupported "
+            "advantage_normalizer: "
+            f"{advantage_normalizer}"
+        )
+
+    # ---------------------------------------------
+    # Return to flat rollout order.
+    # ---------------------------------------------
+
+    advantages = (
+        grouped_advantages.reshape(-1)
+    )
 
     metadata = {
-        "reward_mean": raw_rewards.mean().item(),
-        "reward_std": raw_rewards.std().item(),
-        "advantage_mean": advantages.mean().item(),
+        "reward_mean":
+            raw_rewards.mean().item(),
+
+        "reward_std":
+            raw_rewards.std().item(),
+
+        "advantage_mean":
+            advantages.mean().item(),
+
+        "advantage_std":
+            advantages.std().item(),
+
+        "group_reward_mean":
+            group_means.mean().item(),
     }
 
-    return advantages, metadata
+    return (
+        advantages,
+        metadata,
+    )
 
 def compute_policy_gradient_loss(
         raw_rewards_or_advantages: torch.Tensor,
