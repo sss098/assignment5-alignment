@@ -300,32 +300,348 @@ def compute_group_normalized_rewards(
     )
 
 def compute_policy_gradient_loss(
-        raw_rewards_or_advantages: torch.Tensor,
-        policy_log_probs: torch.Tensor,
-        importance_reweighting_method: str = "none",
-        old_log_probs: torch.Tensor | None = None,
-        cliprange: float | None = None,
-        response_mask: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    raw_rewards_or_advantages: torch.Tensor,
+    policy_log_probs: torch.Tensor,
+    importance_reweighting_method: Literal[
+        "none",
+        "noclip",
+        "grpo",
+        "gspo",
+    ] = "none",
+    old_log_probs: torch.Tensor | None = None,
+    cliprange: float | None = None,
+    response_mask: torch.Tensor | None = None,
+) -> tuple[
+    torch.Tensor,
+    dict[str, torch.Tensor],
+]:
 
-    if raw_rewards_or_advantages.ndim ==1:
-        raw_rewards_or_advantages = raw_rewards_or_advantages.unsqueeze(-1)
+    # -------------------------------------------------
+    # Advantage:
+    #
+    # (B,)
+    #
+    # ->
+    #
+    # (B, 1)
+    #
+    # so it can broadcast across sequence length.
+    # -------------------------------------------------
 
-    if importance_reweighting_method == "none":
-        per_token_policy_gradient_loss = (
-            -raw_rewards_or_advantages * policy_log_probs
+    if raw_rewards_or_advantages.ndim == 1:
+        advantages = (
+            raw_rewards_or_advantages
+            .unsqueeze(-1)
+        )
+    elif raw_rewards_or_advantages.ndim == 2:
+        advantages = (
+            raw_rewards_or_advantages
+        )
+    else:
+        raise ValueError(
+            "raw_rewards_or_advantages must have "
+            "shape (B,) or (B, 1)."
         )
 
-        metadata = {}
+    # =================================================
+    # 1. On-policy / naive off-policy
+    # =================================================
 
-        return(
+    if importance_reweighting_method == "none":
+
+        per_token_policy_gradient_loss = (
+            -advantages
+            * policy_log_probs
+        )
+
+        return (
+            per_token_policy_gradient_loss,
+            {},
+        )
+
+    # =================================================
+    # Every importance-reweighted method needs π_old.
+    # =================================================
+
+    if old_log_probs is None:
+        raise ValueError(
+            "old_log_probs is required when "
+            "importance_reweighting_method "
+            "is not 'none'."
+        )
+
+    if (
+        old_log_probs.shape
+        != policy_log_probs.shape
+    ):
+        raise ValueError(
+            "old_log_probs and policy_log_probs "
+            "must have the same shape."
+        )
+
+    # π_old is fixed.
+    old_log_probs = (
+        old_log_probs.detach()
+    )
+
+    # -------------------------------------------------
+    # log(πθ / πold)
+    #
+    # =
+    #
+    # log πθ - log πold
+    # -------------------------------------------------
+
+    log_ratio = (
+        policy_log_probs
+        - old_log_probs
+    )
+
+    # =================================================
+    # 2. Token-level importance reweighting,
+    #    no clipping.
+    # =================================================
+
+    if importance_reweighting_method == "noclip":
+
+        ratio = torch.exp(
+            log_ratio
+        )
+
+        objective = (
+            advantages
+            * ratio
+        )
+
+        per_token_policy_gradient_loss = (
+            -objective
+        )
+
+        metadata = {
+            "importance_ratio_mean":
+                ratio.detach().mean(),
+        }
+
+        return (
             per_token_policy_gradient_loss,
             metadata,
         )
 
-    raise NotImplementedError(
-        "Only importance_reweighting_method='none' "
-        "is implemented for now."
+    # =================================================
+    # 3. PPO / GRPO token-level clipping
+    # =================================================
+
+    if importance_reweighting_method == "grpo":
+
+        if cliprange is None:
+            raise ValueError(
+                "cliprange is required for "
+                "importance_reweighting_method='grpo'."
+            )
+
+        ratio = torch.exp(
+            log_ratio
+        )
+
+        clipped_ratio = torch.clamp(
+            ratio,
+            min=1.0 - cliprange,
+            max=1.0 + cliprange,
+        )
+
+        unclipped_objective = (
+            advantages
+            * ratio
+        )
+
+        clipped_objective = (
+            advantages
+            * clipped_ratio
+        )
+
+        objective = torch.minimum(
+            unclipped_objective,
+            clipped_objective,
+        )
+
+        per_token_policy_gradient_loss = (
+            -objective
+        )
+
+        # This indicates positions where the clipped
+        # branch actually determines the PPO objective.
+        is_clipped = (
+            clipped_objective
+            < unclipped_objective
+        )
+
+        metadata = {
+            "importance_ratio_mean":
+                ratio.detach().mean(),
+
+            "clip_fraction":
+                (
+                    is_clipped
+                    .float()
+                    .mean()
+                    .detach()
+                ),
+        }
+
+        return (
+            per_token_policy_gradient_loss,
+            metadata,
+        )
+
+    # =================================================
+    # 4. GSPO:
+    #    sequence-level geometric-mean importance ratio
+    # =================================================
+
+    if importance_reweighting_method == "gspo":
+
+        if cliprange is None:
+            raise ValueError(
+                "cliprange is required for "
+                "importance_reweighting_method='gspo'."
+            )
+
+        if response_mask is None:
+            raise ValueError(
+                "response_mask is required for "
+                "importance_reweighting_method='gspo'."
+            )
+
+        if (
+            response_mask.shape
+            != policy_log_probs.shape
+        ):
+            raise ValueError(
+                "response_mask and policy_log_probs "
+                "must have the same shape."
+            )
+
+        mask = response_mask.to(
+            dtype=policy_log_probs.dtype
+        )
+
+        response_lengths = (
+            mask.sum(
+                dim=-1,
+                keepdim=True,
+            )
+        )
+
+        if torch.any(
+            response_lengths == 0
+        ):
+            raise ValueError(
+                "GSPO requires at least one "
+                "response token per sequence."
+            )
+
+        # ---------------------------------------------
+        # log geometric mean:
+        #
+        # log s
+        # =
+        # 1/L * sum_t log(πθ / πold)
+        # ---------------------------------------------
+
+        sequence_log_ratio = (
+            (
+                log_ratio
+                * mask
+            ).sum(
+                dim=-1,
+                keepdim=True,
+            )
+            / response_lengths
+        )
+
+        # ---------------------------------------------
+        # s = exp(mean log ratio)
+        #
+        # shape:
+        # (B, 1)
+        # ---------------------------------------------
+
+        sequence_ratio = torch.exp(
+            sequence_log_ratio
+        )
+
+        clipped_sequence_ratio = (
+            torch.clamp(
+                sequence_ratio,
+                min=1.0 - cliprange,
+                max=1.0 + cliprange,
+            )
+        )
+
+        unclipped_objective = (
+            advantages
+            * sequence_ratio
+        )
+
+        clipped_objective = (
+            advantages
+            * clipped_sequence_ratio
+        )
+
+        sequence_objective = (
+            torch.minimum(
+                unclipped_objective,
+                clipped_objective,
+            )
+        )
+
+        # ---------------------------------------------
+        # aggregate_loss_across_microbatch()
+        # expects a (B, L) tensor.
+        #
+        # GSPO has one sequence-level objective,
+        # so repeat it across token positions.
+        #
+        # The response mask in the aggregation step
+        # will discard prompt/padding positions.
+        # ---------------------------------------------
+
+        per_token_policy_gradient_loss = (
+            -sequence_objective.expand_as(
+                policy_log_probs
+            )
+        )
+
+        is_clipped = (
+            clipped_objective
+            < unclipped_objective
+        )
+
+        metadata = {
+            "sequence_importance_ratio_mean":
+                (
+                    sequence_ratio
+                    .detach()
+                    .mean()
+                ),
+
+            "clip_fraction":
+                (
+                    is_clipped
+                    .float()
+                    .mean()
+                    .detach()
+                ),
+        }
+
+        return (
+            per_token_policy_gradient_loss,
+            metadata,
+        )
+
+    raise ValueError(
+        "Unsupported importance_reweighting_method: "
+        f"{importance_reweighting_method}"
     )
 
 def aggregate_loss_across_microbatch(
